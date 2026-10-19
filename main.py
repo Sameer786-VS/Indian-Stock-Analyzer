@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
@@ -21,13 +20,19 @@ import yfinance as yf
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FOLDER = BASE_DIR / "data" / "processed"
 CHART_FOLDER = BASE_DIR / "charts"
+REPORT_ARCHIVE_FOLDER = DATA_FOLDER / "_archive"
 
 SUPPORT_RESISTANCE_PERIOD = 60
 VOLUME_AVERAGE_PERIOD = 20
 HIGH_VOLUME_MULTIPLIER = 1.5
 MAX_SCAN_STOCKS = 50
 
-# Try both Yahoo chart hosts.
+# Baseline backtest settings. Costs are illustrative assumptions.
+BACKTEST_HOLDING_SESSIONS = 5
+BACKTEST_MIN_SETUP_SCORE = 4
+BACKTEST_ROUND_TRIP_COST_PCT = 0.20
+BACKTEST_REQUIRE_POSITIVE_RELATIVE_STRENGTH = True
+
 YAHOO_HOSTS = [
     "query2.finance.yahoo.com",
     "query1.finance.yahoo.com"
@@ -44,6 +49,56 @@ HEADERS = {
 
 DATA_FOLDER.mkdir(parents=True, exist_ok=True)
 CHART_FOLDER.mkdir(parents=True, exist_ok=True)
+REPORT_ARCHIVE_FOLDER.mkdir(parents=True, exist_ok=True)
+
+
+def archive_existing_reports():
+    """Archive older timestamped scanner/backtest reports."""
+    patterns = (
+        "scanner_results_20*.csv",
+        "scanner_errors_20*.csv",
+        "backtest_summary_*_20*.csv",
+        "backtest_trades_*_20*.csv",
+    )
+
+    moved = 0
+
+    for pattern in patterns:
+        for source in DATA_FOLDER.glob(pattern):
+            if not source.is_file():
+                continue
+
+            destination = REPORT_ARCHIVE_FOLDER / source.name
+
+            if destination.exists():
+                counter = 1
+
+                while True:
+                    alternative = REPORT_ARCHIVE_FOLDER / (
+                        f"{source.stem}_{counter}{source.suffix}"
+                    )
+
+                    if not alternative.exists():
+                        destination = alternative
+                        break
+
+                    counter += 1
+
+            try:
+                source.replace(destination)
+                moved += 1
+
+            except OSError as error:
+                print(
+                    f"Warning: Could not archive "
+                    f"{source.name}: {error}"
+                )
+
+    if moved:
+        print(
+            f"Archived {moved} old report file(s) to: "
+            f"{REPORT_ARCHIVE_FOLDER.resolve()}"
+        )
 
 
 # =========================================================
@@ -54,6 +109,9 @@ ALIASES = {
     "HDFC": "HDFCBANK.NS",
     "HDFC BANK": "HDFCBANK.NS",
     "HDFC BANK LIMITED": "HDFCBANK.NS",
+    "HDCF BANK": "HDFCBANK.NS",
+    "HDCFBANK": "HDFCBANK.NS",
+    "HDCFBANK.NS": "HDFCBANK.NS",
     "ICICI": "ICICIBANK.NS",
     "ICI": "ICICIBANK.NS",
     "ICICI BANK": "ICICIBANK.NS",
@@ -81,8 +139,7 @@ ALIASES = {
 
 
 def normalize_symbol(raw_symbol):
-    """Convert common company names or tickers into Yahoo symbols."""
-
+    """Convert company names or tickers into Yahoo Finance symbols."""
     name = " ".join(raw_symbol.strip().upper().split())
 
     if not name:
@@ -93,7 +150,6 @@ def normalize_symbol(raw_symbol):
 
     symbol = name.replace(" ", "")
 
-    # Preserve explicit exchange suffixes such as .NS or .BO.
     if "." not in symbol and not symbol.startswith("^"):
         symbol += ".NS"
 
@@ -149,11 +205,7 @@ def get_scan_symbols():
 # =========================================================
 
 def fetch_yahoo_chart_with_requests(symbol):
-    """
-    Try Yahoo's public chart endpoint with requests.
-    Retry and try both query2 and query1 hosts.
-    """
-
+    """Try Yahoo Finance's public chart endpoint with retries."""
     encoded_symbol = quote(symbol, safe="")
     errors = []
 
@@ -181,7 +233,6 @@ def fetch_yahoo_chart_with_requests(symbol):
                     timeout=(10, 25)
                 )
 
-                # Retry temporary server/rate-limit errors.
                 if response.status_code in {
                     429, 500, 502, 503, 504
                 } and attempt < 2:
@@ -189,7 +240,6 @@ def fetch_yahoo_chart_with_requests(symbol):
                     continue
 
                 response.raise_for_status()
-
                 payload = response.json()
 
                 chart = payload.get("chart", {})
@@ -237,7 +287,6 @@ def fetch_yahoo_chart_with_requests(symbol):
 
                     return values[:number_of_rows]
 
-                # Build one row for each returned trading date.
                 frame = pd.DataFrame(
                     {
                         "Open": fit_length(
@@ -264,8 +313,6 @@ def fetch_yahoo_chart_with_requests(symbol):
                 )
 
                 # Apply Yahoo's adjusted-close factor to OHLC.
-                # This makes historical prices more comparable
-                # around dividends and stock splits.
                 adjusted_rows = indicators.get("adjclose", [])
                 adjusted_close = None
 
@@ -308,10 +355,10 @@ def fetch_yahoo_chart_with_requests(symbol):
                         adjusted_close.notna(),
                         raw_close
                     )
+
                 else:
                     frame["Close"] = raw_close
 
-                # Convert dates to the exchange's local timezone.
                 exchange_timezone = (
                     result.get("meta", {})
                     .get("exchangeTimezoneName")
@@ -374,11 +421,7 @@ def fetch_yahoo_chart_with_requests(symbol):
 # =========================================================
 
 def download_stock_data(symbol):
-    """
-    First try requests against both Yahoo hosts.
-    If those requests fail, try yfinance as a fallback.
-    """
-
+    """Try requests first, then use yfinance as a fallback."""
     print(f"\nDownloading historical data for {symbol}...")
 
     request_error = None
@@ -459,13 +502,62 @@ def download_stock_data(symbol):
 
 
 # =========================================================
+# 4A. NIFTY 50 RELATIVE-STRENGTH ANALYSIS
+# =========================================================
+
+def download_nifty50_data():
+    """Download NIFTY 50 data for comparison with individual stocks."""
+    try:
+        return download_stock_data("^NSEI")
+    except Exception as error:
+        print(f"Warning: Could not download NIFTY 50 benchmark: {error}")
+        return None
+
+
+def add_relative_strength(stock_data, benchmark_data):
+    """Compare a stock's 20-session return with NIFTY 50."""
+    stock = stock_data.copy()
+
+    if benchmark_data is None or benchmark_data.empty:
+        stock["NIFTY50_Return_20D_Pct"] = np.nan
+        stock["Relative_Strength_20D_Pct"] = np.nan
+        return stock
+
+    benchmark = benchmark_data.copy()
+
+    for frame in (stock, benchmark):
+        index = pd.DatetimeIndex(frame.index)
+
+        if index.tz is not None:
+            index = index.tz_localize(None)
+
+        frame.index = index.normalize()
+        frame.sort_index(inplace=True)
+
+    stock = stock[~stock.index.duplicated(keep="last")]
+    benchmark = benchmark[~benchmark.index.duplicated(keep="last")]
+
+    nifty_returns = benchmark["Close"].pct_change(20) * 100
+
+    stock["NIFTY50_Return_20D_Pct"] = (
+        nifty_returns.reindex(stock.index)
+    )
+
+    stock["Relative_Strength_20D_Pct"] = (
+        stock["Return_20D_Pct"]
+        - stock["NIFTY50_Return_20D_Pct"]
+    )
+
+    return stock
+
+
+# =========================================================
 # 5. CALCULATE TECHNICAL INDICATORS
 # =========================================================
 
 def calculate_indicators(data):
     data = data.copy()
 
-    # Daily and 20-session returns.
     data["Daily_Return_Pct"] = (
         data["Close"].pct_change() * 100
     )
@@ -474,7 +566,6 @@ def calculate_indicators(data):
         data["Close"].pct_change(20) * 100
     )
 
-    # Moving averages.
     for period in [20, 50, 200]:
         data[f"SMA_{period}"] = (
             data["Close"].rolling(period).mean()
@@ -538,7 +629,7 @@ def calculate_indicators(data):
         * np.sqrt(252)
     )
 
-    # Support and resistance based on previous 60 sessions.
+    # Support and resistance use the previous 60 sessions.
     data["Support_60D"] = (
         data["Low"]
         .rolling(SUPPORT_RESISTANCE_PERIOD, min_periods=60)
@@ -553,7 +644,6 @@ def calculate_indicators(data):
         .shift(1)
     )
 
-    # Average volume excludes today's session.
     data["Avg_Volume_20D"] = (
         data["Volume"]
         .rolling(VOLUME_AVERAGE_PERIOD, min_periods=20)
@@ -571,7 +661,6 @@ def calculate_indicators(data):
         >= HIGH_VOLUME_MULTIPLIER
     ).fillna(False)
 
-    # Fresh breakout/breakdown crossings.
     previous_close = data["Close"].shift(1)
 
     previous_resistance = data["Resistance_60D"].shift(1)
@@ -607,9 +696,8 @@ def calculate_indicators(data):
 # 6. RULE-BASED SCREENING SCORE
 # =========================================================
 
-def calculate_setup_score(latest):
-    score = 0
-
+def calculate_score_details(latest):
+    """Return the score and the contribution of each rule."""
     close = latest["Close"]
     sma20 = latest["SMA_20"]
     sma50 = latest["SMA_50"]
@@ -617,28 +705,37 @@ def calculate_setup_score(latest):
     return20 = latest["Return_20D_Pct"]
     rsi = latest["RSI_14"]
 
-    if pd.notna(sma20) and close > sma20:
-        score += 1
+    details = {
+        "Score_Close_Above_SMA20": int(
+            pd.notna(sma20) and close > sma20
+        ),
+        "Score_SMA20_Above_SMA50": int(
+            pd.notna(sma20) and pd.notna(sma50) and sma20 > sma50
+        ),
+        "Score_Close_Above_SMA200": int(
+            pd.notna(sma200) and close > sma200
+        ),
+        "Score_Positive_Return_20D": int(
+            pd.notna(return20) and return20 > 0
+        ),
+        "Score_RSI_50_70": int(
+            pd.notna(rsi) and 50 <= rsi <= 70
+        ),
+        "Score_Breakout_Bonus": (
+            2 if bool(latest["Breakout_Confirmed"]) else 0
+        ),
+        "Score_Breakdown_Penalty": (
+            -2 if bool(latest["Breakdown_Confirmed"]) else 0
+        ),
+    }
 
-    if pd.notna(sma20) and pd.notna(sma50) and sma20 > sma50:
-        score += 1
+    details["Setup_Score"] = sum(details.values())
+    return details
 
-    if pd.notna(sma200) and close > sma200:
-        score += 1
 
-    if pd.notna(return20) and return20 > 0:
-        score += 1
-
-    if pd.notna(rsi) and 50 <= rsi <= 70:
-        score += 1
-
-    if bool(latest["Breakout_Confirmed"]):
-        score += 2
-
-    if bool(latest["Breakdown_Confirmed"]):
-        score -= 2
-
-    return score
+def calculate_setup_score(latest):
+    """Calculate the rule-based setup score."""
+    return calculate_score_details(latest)["Setup_Score"]
 
 
 def determine_assessment(latest, score):
@@ -674,7 +771,8 @@ def build_scan_record(symbol, data):
     else:
         trend = "Insufficient data"
 
-    score = calculate_setup_score(latest)
+    score_details = calculate_score_details(latest)
+    score = score_details["Setup_Score"]
 
     return {
         "Symbol": symbol,
@@ -682,6 +780,12 @@ def build_scan_record(symbol, data):
         "Close": close,
         "Daily_Return_Pct": latest["Daily_Return_Pct"],
         "Return_20D_Pct": latest["Return_20D_Pct"],
+        "NIFTY50_Return_20D_Pct": latest.get(
+            "NIFTY50_Return_20D_Pct", np.nan
+        ),
+        "Relative_Strength_20D_Pct": latest.get(
+            "Relative_Strength_20D_Pct", np.nan
+        ),
         "SMA_20": latest["SMA_20"],
         "SMA_50": latest["SMA_50"],
         "SMA_200": latest["SMA_200"],
@@ -707,6 +811,13 @@ def build_scan_record(symbol, data):
         ),
         "Trend": trend,
         "Setup_Score": score,
+        "Score_Close_Above_SMA20": score_details["Score_Close_Above_SMA20"],
+        "Score_SMA20_Above_SMA50": score_details["Score_SMA20_Above_SMA50"],
+        "Score_Close_Above_SMA200": score_details["Score_Close_Above_SMA200"],
+        "Score_Positive_Return_20D": score_details["Score_Positive_Return_20D"],
+        "Score_RSI_50_70": score_details["Score_RSI_50_70"],
+        "Score_Breakout_Bonus": score_details["Score_Breakout_Bonus"],
+        "Score_Breakdown_Penalty": score_details["Score_Breakdown_Penalty"],
         "Assessment": determine_assessment(latest, score)
     }
 
@@ -755,6 +866,32 @@ def show_summary(symbol, data):
     print(f"ATR percentage:         {show_number('ATR_Pct')}%")
     print(f"20-session return:      {show_number('Return_20D_Pct')}%")
 
+    print("\n--- Relative Strength vs NIFTY 50 ---")
+    print(
+        f"NIFTY 50 return (20 sessions): "
+        f"{show_number('NIFTY50_Return_20D_Pct')}%"
+    )
+    print(
+        f"Relative performance: "
+        f"{show_number('Relative_Strength_20D_Pct')} "
+        "percentage points"
+    )
+
+    relative_strength = latest.get(
+        "Relative_Strength_20D_Pct", np.nan
+    )
+
+    if pd.isna(relative_strength):
+        relative_status = "Unavailable"
+    elif relative_strength > 0.5:
+        relative_status = "Outperforming NIFTY 50"
+    elif relative_strength < -0.5:
+        relative_status = "Underperforming NIFTY 50"
+    else:
+        relative_status = "Performing broadly in line"
+
+    print(f"Relative strength status: {relative_status}")
+
     print("\n--- Support and Resistance ---")
     print(f"Support:                Rs. {show_number('Support_60D')}")
     print(f"Resistance:             Rs. {show_number('Resistance_60D')}")
@@ -786,6 +923,20 @@ def show_summary(symbol, data):
     print(f"Trend:                  {record['Trend']}")
     print(f"Rule-based score:       {record['Setup_Score']}")
     print(f"Assessment:             {record['Assessment']}")
+    print("Score breakdown (each trend/return/RSI rule is worth 1 point):")
+
+    score_rows = [
+        ("Close above SMA 20", "Score_Close_Above_SMA20"),
+        ("SMA 20 above SMA 50", "Score_SMA20_Above_SMA50"),
+        ("Close above SMA 200", "Score_Close_Above_SMA200"),
+        ("Positive 20-session return", "Score_Positive_Return_20D"),
+        ("RSI between 50 and 70", "Score_RSI_50_70"),
+        ("Confirmed breakout bonus", "Score_Breakout_Bonus"),
+        ("Confirmed breakdown penalty", "Score_Breakdown_Penalty"),
+    ]
+
+    for label, key in score_rows:
+        print(f"  {label:<32} {record[key]:+d}")
 
     recent_columns = [
         "Close",
@@ -828,7 +979,6 @@ def save_outputs(
     )
 
     csv_path = DATA_FOLDER / f"{safe_symbol}_history.csv"
-
     data.to_csv(csv_path)
 
     print(f"\nCSV saved:\n{csv_path.resolve()}")
@@ -886,23 +1036,35 @@ def save_outputs(
     confirmed_down = chart_data[chart_data["Breakdown_Confirmed"]]
 
     price_ax.scatter(
-        breakouts.index, breakouts["Close"],
-        marker="^", s=55, label="Breakout"
+        breakouts.index,
+        breakouts["Close"],
+        marker="^",
+        s=55,
+        label="Breakout"
     )
 
     price_ax.scatter(
-        breakdowns.index, breakdowns["Close"],
-        marker="v", s=55, label="Breakdown"
+        breakdowns.index,
+        breakdowns["Close"],
+        marker="v",
+        s=55,
+        label="Breakdown"
     )
 
     price_ax.scatter(
-        confirmed_up.index, confirmed_up["Close"],
-        marker="*", s=120, label="Volume-confirmed breakout"
+        confirmed_up.index,
+        confirmed_up["Close"],
+        marker="*",
+        s=120,
+        label="Volume-confirmed breakout"
     )
 
     price_ax.scatter(
-        confirmed_down.index, confirmed_down["Close"],
-        marker="X", s=65, label="Volume-confirmed breakdown"
+        confirmed_down.index,
+        confirmed_down["Close"],
+        marker="X",
+        s=65,
+        label="Volume-confirmed breakdown"
     )
 
     price_ax.set_title(f"{symbol} - Price and Technical Analysis")
@@ -972,6 +1134,9 @@ def analyze_stock():
         data = download_stock_data(symbol)
         data = calculate_indicators(data)
 
+        benchmark_data = download_nifty50_data()
+        data = add_relative_strength(data, benchmark_data)
+
         show_summary(symbol, data)
 
         save_outputs(
@@ -995,6 +1160,7 @@ def analyze_stock():
 def scan_multiple_stocks():
     try:
         symbols = get_scan_symbols()
+
     except ValueError as error:
         print(f"\nInput error: {error}")
         return
@@ -1003,6 +1169,9 @@ def scan_multiple_stocks():
     errors = []
 
     print(f"\nStarting scan of {len(symbols)} stocks.")
+    print("Downloading NIFTY 50 benchmark once for the scan...")
+
+    benchmark_data = download_nifty50_data()
 
     for position, symbol in enumerate(symbols, start=1):
         print(f"\n[{position}/{len(symbols)}] {symbol}")
@@ -1010,11 +1179,11 @@ def scan_multiple_stocks():
         try:
             data = download_stock_data(symbol)
             data = calculate_indicators(data)
+            data = add_relative_strength(data, benchmark_data)
 
             record = build_scan_record(symbol, data)
             records.append(record)
 
-            # Save chart and CSV, without opening every chart.
             save_outputs(
                 symbol,
                 data,
@@ -1035,7 +1204,6 @@ def scan_multiple_stocks():
             })
             print(f"Failed to analyze {symbol}: {error}")
 
-        # Small pause between stock requests.
         time.sleep(0.5)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1050,11 +1218,11 @@ def scan_multiple_stocks():
         ).reset_index(drop=True)
 
         report_path = (
-            DATA_FOLDER / f"scanner_results_{timestamp}.csv"
+            REPORT_ARCHIVE_FOLDER
+            / f"scanner_results_{timestamp}.csv"
         )
-        latest_report = (
-            DATA_FOLDER / "scanner_results_latest.csv"
-        )
+
+        latest_report = DATA_FOLDER / "scanner_results_latest.csv"
 
         results.to_csv(report_path, index=False)
         results.to_csv(latest_report, index=False)
@@ -1064,11 +1232,20 @@ def scan_multiple_stocks():
             "Close",
             "Daily_Return_Pct",
             "Return_20D_Pct",
+            "NIFTY50_Return_20D_Pct",
+            "Relative_Strength_20D_Pct",
             "RSI_14",
             "Relative_Volume_20D",
             "Breakout_Confirmed",
             "Breakdown_Confirmed",
             "Setup_Score",
+            "Score_Close_Above_SMA20",
+            "Score_SMA20_Above_SMA50",
+            "Score_Close_Above_SMA200",
+            "Score_Positive_Return_20D",
+            "Score_RSI_50_70",
+            "Score_Breakout_Bonus",
+            "Score_Breakdown_Penalty",
             "Assessment"
         ]
 
@@ -1092,18 +1269,554 @@ def scan_multiple_stocks():
 
     if errors:
         error_path = (
-            DATA_FOLDER / f"scanner_errors_{timestamp}.csv"
+            REPORT_ARCHIVE_FOLDER
+            / f"scanner_errors_{timestamp}.csv"
         )
 
         pd.DataFrame(errors).to_csv(error_path, index=False)
         print(f"\nError report:\n{error_path.resolve()}")
 
-    print(f"\nCSV folder:   {DATA_FOLDER.resolve()}")
+    print(f"\nLatest/current CSV folder: {DATA_FOLDER.resolve()}")
+    print(f"Archived timestamped reports: {REPORT_ARCHIVE_FOLDER.resolve()}")
     print(f"Chart folder: {CHART_FOLDER.resolve()}")
 
 
 # =========================================================
-# 11. MAIN MENU
+# 11. BASIC HISTORICAL BACKTEST
+# =========================================================
+
+def _plain_date_index(frame):
+    """Return a copy with timezone-free normalized dates."""
+    result = frame.copy()
+
+    idx = pd.DatetimeIndex(result.index)
+
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+
+    result.index = idx.normalize()
+    result = result[~result.index.duplicated(keep="last")]
+
+    return result.sort_index()
+
+
+def _calculate_aligned_benchmark(
+    data,
+    start_date,
+    end_date,
+    start_price_field="Open"
+):
+    """Calculate buy-and-hold over the explicitly aligned test window.
+
+    For a completed strategy:
+      - Start at the first actual trade entry's Open.
+      - End at the final trade exit's Close.
+
+    For a run with no trades:
+      - The caller requests Close-to-Close over the available
+        indicator-ready data window.
+
+    Missing dates/prices are reported as unavailable.
+    The function does not silently substitute unrelated dates.
+    """
+
+    start_stamp = (
+        pd.Timestamp(start_date).tz_localize(None).normalize()
+    )
+
+    end_stamp = (
+        pd.Timestamp(end_date).tz_localize(None).normalize()
+    )
+
+    result = {
+        "Benchmark_Start_Date": start_stamp.date().isoformat(),
+        "Benchmark_End_Date": end_stamp.date().isoformat(),
+        "Benchmark_Start_Price_Field": start_price_field,
+        "Benchmark_End_Price_Field": "Close",
+        "Benchmark_Start_Price": np.nan,
+        "Benchmark_End_Price": np.nan,
+        "Benchmark_Return_Method": (
+            f"{start_price_field}-to-Close over the aligned "
+            "reporting window"
+        ),
+        "Benchmark_Session_Count": np.nan,
+        "Benchmark_Status": "Unavailable: date or price missing",
+        "Benchmark_Investment_Exposure": (
+            "Continuous buy-and-hold exposure; strategy may be "
+            "in cash between trades"
+        ),
+        "Benchmark_Assumed_Round_Trip_Cost_Pct": (
+            BACKTEST_ROUND_TRIP_COST_PCT
+        ),
+        "Stock_Buy_And_Hold_Return_Pct": np.nan,
+        "Stock_Buy_And_Hold_Gross_Return_Pct": np.nan,
+        "Stock_Buy_And_Hold_Net_Return_Pct": np.nan,
+    }
+
+    if end_stamp < start_stamp:
+        result["Benchmark_Status"] = (
+            "Unavailable: end date precedes start date"
+        )
+        return result
+
+    normalized = _plain_date_index(data)
+
+    if (
+        start_stamp not in normalized.index
+        or end_stamp not in normalized.index
+    ):
+        return result
+
+    if (
+        start_price_field not in normalized.columns
+        or "Close" not in normalized.columns
+    ):
+        result["Benchmark_Status"] = (
+            "Unavailable: required price column missing"
+        )
+        return result
+
+    start_price = pd.to_numeric(
+        normalized.at[start_stamp, start_price_field],
+        errors="coerce"
+    )
+
+    end_price = pd.to_numeric(
+        normalized.at[end_stamp, "Close"],
+        errors="coerce"
+    )
+
+    if (
+        pd.isna(start_price)
+        or pd.isna(end_price)
+        or start_price <= 0
+        or end_price <= 0
+    ):
+        return result
+
+    start_position = int(normalized.index.get_loc(start_stamp))
+    end_position = int(normalized.index.get_loc(end_stamp))
+
+    gross_return = (end_price / start_price - 1) * 100
+
+    result.update({
+        "Benchmark_Start_Price": float(start_price),
+        "Benchmark_End_Price": float(end_price),
+        "Benchmark_Session_Count": (
+            end_position - start_position + 1
+        ),
+        "Benchmark_Status": "Completed: dates aligned",
+        "Stock_Buy_And_Hold_Return_Pct": float(gross_return),
+        "Stock_Buy_And_Hold_Gross_Return_Pct": float(gross_return),
+        "Stock_Buy_And_Hold_Net_Return_Pct": float(
+            gross_return - BACKTEST_ROUND_TRIP_COST_PCT
+        ),
+    })
+
+    return result
+
+
+def backtest_strategy(symbol, data):
+    """Run the baseline rule-based historical simulation.
+
+    Rules:
+      - Signal after the close when score meets the threshold.
+      - Require positive relative strength when enabled.
+      - Do not enter when a breakdown is confirmed.
+      - Enter on the next session's Open.
+      - Exit at the Close after the configured holding sessions.
+      - Subtract the illustrative round-trip cost.
+
+    Only one trade may be open at a time.
+    """
+
+    hold_sessions = BACKTEST_HOLDING_SESSIONS
+    trades = []
+
+    if data is None or data.empty:
+        return pd.DataFrame(), {"Status": "No data"}
+
+    data = data.copy().sort_index()
+
+    if len(data) <= 200 + hold_sessions:
+        return pd.DataFrame(), {
+            "Status": "Insufficient historical sessions after warm-up"
+        }
+
+    first_ready_positions = np.flatnonzero(
+        data["SMA_200"].notna().to_numpy()
+    )
+
+    if len(first_ready_positions) == 0:
+        return pd.DataFrame(), {
+            "Status": "SMA 200 is unavailable"
+        }
+
+    start_pos = int(first_ready_positions[0])
+    last_exit_pos = -1
+    last_possible_signal_pos = len(data) - hold_sessions - 1
+
+    for signal_pos in range(
+        start_pos,
+        last_possible_signal_pos + 1
+    ):
+        if signal_pos <= last_exit_pos:
+            continue
+
+        signal = data.iloc[signal_pos]
+        score = calculate_setup_score(signal)
+
+        relative_strength = signal.get(
+            "Relative_Strength_20D_Pct",
+            np.nan
+        )
+
+        breakdown = bool(
+            signal.get("Breakdown_Confirmed", False)
+        )
+
+        if score < BACKTEST_MIN_SETUP_SCORE:
+            continue
+
+        if breakdown:
+            continue
+
+        if BACKTEST_REQUIRE_POSITIVE_RELATIVE_STRENGTH and (
+            pd.isna(relative_strength)
+            or relative_strength <= 0
+        ):
+            continue
+
+        entry_pos = signal_pos + 1
+        exit_pos = entry_pos + hold_sessions - 1
+
+        if exit_pos >= len(data):
+            break
+
+        entry_row = data.iloc[entry_pos]
+        exit_row = data.iloc[exit_pos]
+
+        entry_price = entry_row["Open"]
+        exit_price = exit_row["Close"]
+
+        if (
+            pd.isna(entry_price)
+            or pd.isna(exit_price)
+            or entry_price <= 0
+            or exit_price <= 0
+        ):
+            continue
+
+        gross_return = (exit_price / entry_price - 1) * 100
+        cost_pct = BACKTEST_ROUND_TRIP_COST_PCT
+        net_return = gross_return - cost_pct
+
+        score_details = calculate_score_details(signal)
+
+        trades.append({
+            "Symbol": symbol,
+            "Signal_Date": (
+                pd.Timestamp(data.index[signal_pos])
+                .date()
+                .isoformat()
+            ),
+            "Entry_Date": (
+                pd.Timestamp(data.index[entry_pos])
+                .date()
+                .isoformat()
+            ),
+            "Exit_Date": (
+                pd.Timestamp(data.index[exit_pos])
+                .date()
+                .isoformat()
+            ),
+            "Entry_Price": float(entry_price),
+            "Exit_Price": float(exit_price),
+            "Holding_Sessions": hold_sessions,
+            "Signal_Setup_Score": int(score),
+            "Signal_Relative_Strength_20D_Pct": relative_strength,
+            "Signal_RSI_14": signal.get("RSI_14", np.nan),
+            "Signal_Relative_Volume_20D": signal.get(
+                "Relative_Volume_20D",
+                np.nan
+            ),
+            "Gross_Return_Pct": gross_return,
+            "Assumed_Round_Trip_Cost_Pct": cost_pct,
+            "Net_Return_Pct": net_return,
+            "Outcome": (
+                "Win" if net_return > 0 else "Loss/Flat"
+            ),
+            **{
+                key: value
+                for key, value in score_details.items()
+                if key != "Setup_Score"
+            }
+        })
+
+        last_exit_pos = exit_pos
+
+    trades_df = pd.DataFrame(trades)
+
+    if trades_df.empty:
+        test_start = (
+            pd.Timestamp(data.index[start_pos])
+            .date()
+            .isoformat()
+        )
+
+        test_end = (
+            pd.Timestamp(data.index[-1])
+            .date()
+            .isoformat()
+        )
+
+        benchmark = _calculate_aligned_benchmark(
+            data,
+            test_start,
+            test_end,
+            start_price_field="Close"
+        )
+
+        benchmark["Benchmark_Return_Method"] = (
+            "Close-to-Close over indicator-ready window "
+            "(no qualifying trades)"
+        )
+
+        return trades_df, {
+            "Symbol": symbol,
+            "Status": (
+                "No qualifying trades found with current rules"
+            ),
+            "Test_Start": test_start,
+            "Test_End": test_end,
+            "First_Signal_Date": None,
+            "Holding_Sessions": hold_sessions,
+            "Minimum_Setup_Score": BACKTEST_MIN_SETUP_SCORE,
+            "Require_Positive_Relative_Strength": (
+                BACKTEST_REQUIRE_POSITIVE_RELATIVE_STRENGTH
+            ),
+            "Assumed_Round_Trip_Cost_Pct": (
+                BACKTEST_ROUND_TRIP_COST_PCT
+            ),
+            "Number_Of_Trades": 0,
+            "Win_Rate_Pct": np.nan,
+            "Average_Gross_Trade_Return_Pct": np.nan,
+            "Average_Net_Trade_Return_Pct": np.nan,
+            "Median_Net_Trade_Return_Pct": np.nan,
+            "Profit_Factor": np.nan,
+            "Compounded_Strategy_Return_Pct": 0.0,
+            "Maximum_Trade_Close_Drawdown_Pct": 0.0,
+            **benchmark,
+        }
+
+    # Each sequential trade uses the full simulated allocation.
+    equity = 1.0
+    exit_to_return = {}
+
+    for _, trade in trades_df.iterrows():
+        exit_to_return[trade["Exit_Date"]] = trade["Net_Return_Pct"]
+
+    daily_equity = []
+
+    for idx in data.index[start_pos:]:
+        date_key = pd.Timestamp(idx).date().isoformat()
+
+        if date_key in exit_to_return:
+            equity *= (
+                1 + float(exit_to_return[date_key]) / 100
+            )
+
+        daily_equity.append(equity)
+
+    equity_series = pd.Series(daily_equity, dtype=float)
+
+    if not equity_series.empty:
+        peaks = equity_series.cummax()
+        drawdown = (equity_series / peaks - 1) * 100
+        max_drawdown = float(drawdown.min())
+    else:
+        max_drawdown = 0.0
+
+    net_returns = trades_df["Net_Return_Pct"].astype(float)
+    gross_returns = trades_df["Gross_Return_Pct"].astype(float)
+
+    losers = net_returns[net_returns < 0]
+    winners = net_returns[net_returns > 0]
+
+    if len(losers) and losers.abs().sum() > 0:
+        profit_factor = float(
+            winners.sum() / losers.abs().sum()
+        )
+    else:
+        profit_factor = np.nan
+
+    # Benchmark dates now match the first strategy entry and final exit.
+    test_start = trades_df["Entry_Date"].iloc[0]
+    test_end = trades_df["Exit_Date"].iloc[-1]
+
+    benchmark = _calculate_aligned_benchmark(
+        data,
+        test_start,
+        test_end,
+        start_price_field="Open"
+    )
+
+    summary = {
+        "Symbol": symbol,
+        "Status": "Completed",
+        "Test_Start": test_start,
+        "Test_End": test_end,
+        "First_Signal_Date": trades_df["Signal_Date"].iloc[0],
+        "Holding_Sessions": hold_sessions,
+        "Minimum_Setup_Score": BACKTEST_MIN_SETUP_SCORE,
+        "Require_Positive_Relative_Strength": (
+            BACKTEST_REQUIRE_POSITIVE_RELATIVE_STRENGTH
+        ),
+        "Assumed_Round_Trip_Cost_Pct": (
+            BACKTEST_ROUND_TRIP_COST_PCT
+        ),
+        "Number_Of_Trades": int(len(trades_df)),
+        "Win_Rate_Pct": float(
+            (net_returns > 0).mean() * 100
+        ),
+        "Average_Gross_Trade_Return_Pct": float(
+            gross_returns.mean()
+        ),
+        "Average_Net_Trade_Return_Pct": float(
+            net_returns.mean()
+        ),
+        "Median_Net_Trade_Return_Pct": float(
+            net_returns.median()
+        ),
+        "Profit_Factor": profit_factor,
+        "Compounded_Strategy_Return_Pct": float(
+            (equity - 1) * 100
+        ),
+        "Maximum_Trade_Close_Drawdown_Pct": max_drawdown,
+        **benchmark,
+    }
+
+    return trades_df, summary
+
+
+def backtest_one_stock():
+    """Download one stock, run the backtest, and save reports."""
+    try:
+        symbol = get_stock_symbol()
+
+        data = download_stock_data(symbol)
+        data = calculate_indicators(data)
+
+        benchmark_data = download_nifty50_data()
+        data = add_relative_strength(data, benchmark_data)
+
+        trades_df, summary = backtest_strategy(symbol, data)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        safe_symbol = (
+            symbol.replace(".", "_")
+            .replace("^", "")
+            .replace("/", "_")
+            .replace("\\", "_")
+        )
+
+        trades_path = (
+            REPORT_ARCHIVE_FOLDER
+            / f"backtest_trades_{safe_symbol}_{timestamp}.csv"
+        )
+
+        summary_path = (
+            REPORT_ARCHIVE_FOLDER
+            / f"backtest_summary_{safe_symbol}_{timestamp}.csv"
+        )
+
+        latest_trades_path = (
+            DATA_FOLDER / "backtest_trades_latest.csv"
+        )
+
+        latest_summary_path = (
+            DATA_FOLDER / "backtest_summary_latest.csv"
+        )
+
+        trades_df.to_csv(trades_path, index=False)
+        trades_df.to_csv(latest_trades_path, index=False)
+
+        pd.DataFrame([summary]).to_csv(
+            summary_path,
+            index=False
+        )
+
+        pd.DataFrame([summary]).to_csv(
+            latest_summary_path,
+            index=False
+        )
+
+        print("\n" + "=" * 64)
+        print(f"BASELINE HISTORICAL BACKTEST: {symbol}")
+        print("=" * 64)
+
+        for key, value in summary.items():
+            if isinstance(value, (float, np.floating)) and pd.notna(value):
+                print(
+                    f"{key.replace('_', ' '):<43} "
+                    f"{value:,.2f}"
+                )
+            else:
+                print(f"{key.replace('_', ' '):<43} {value}")
+
+        if trades_df.empty:
+            print(
+                "\nNo qualifying trades were generated. "
+                "That is a result, not a download error."
+            )
+
+        else:
+            show_cols = [
+                "Signal_Date",
+                "Entry_Date",
+                "Exit_Date",
+                "Entry_Price",
+                "Exit_Price",
+                "Signal_Setup_Score",
+                "Gross_Return_Pct",
+                "Assumed_Round_Trip_Cost_Pct",
+                "Net_Return_Pct",
+                "Outcome"
+            ]
+
+            print("\n--- Recent Backtest Trades ---")
+            print(
+                trades_df[show_cols]
+                .tail(15)
+                .round(2)
+                .to_string(index=False)
+            )
+
+        print(f"\nTrade details CSV: {trades_path.resolve()}")
+        print(f"Latest trade report: {latest_trades_path.resolve()}")
+        print(f"Summary CSV: {summary_path.resolve()}")
+        print(f"Latest summary: {latest_summary_path.resolve()}")
+        print(
+            f"Archived timestamped reports: "
+            f"{REPORT_ARCHIVE_FOLDER.resolve()}"
+        )
+        print(
+            "\nImportant: this is a simplified historical simulation, "
+            "not a prediction."
+        )
+        print(
+            "Costs are illustrative; taxes, slippage, liquidity, "
+            "and live execution are not fully modelled."
+        )
+
+    except Exception as error:
+        print(f"\nCould not complete backtest: {error}")
+        traceback.print_exc()
+
+
+# =========================================================
+# 12. MAIN MENU
 # =========================================================
 
 def main():
@@ -1113,9 +1826,10 @@ def main():
         print("=" * 50)
         print("1. Analyze one stock")
         print("2. Scan multiple stocks")
-        print("3. Exit")
+        print("3. Backtest one stock (historical simulation)")
+        print("4. Exit")
 
-        choice = input("\nChoose an option (1-3): ").strip()
+        choice = input("\nChoose an option (1-4): ").strip()
 
         if choice == "1":
             analyze_stock()
@@ -1124,16 +1838,20 @@ def main():
             scan_multiple_stocks()
 
         elif choice == "3":
+            backtest_one_stock()
+
+        elif choice == "4":
             print("\nProgram closed.")
             break
 
         else:
-            print("\nInvalid choice. Enter 1, 2, or 3.")
+            print("\nInvalid choice. Enter a number from 1 to 4.")
 
 
 # =========================================================
-# 12. START PROGRAM
+# 13. START PROGRAM
 # =========================================================
 
 if __name__ == "__main__":
+    archive_existing_reports()
     main()
