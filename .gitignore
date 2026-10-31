@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.zip
+
+data/processed/**/input_bars/
+data/processed/**/raw_input_bars/
+data/processed/**/dual_basis_bars/
+data/processed/**/input_dual_basis/
+data/processed/**/bhavcopy_cache/
